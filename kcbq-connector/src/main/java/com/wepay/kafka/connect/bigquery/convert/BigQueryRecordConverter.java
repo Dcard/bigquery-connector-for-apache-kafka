@@ -24,6 +24,7 @@
 package com.wepay.kafka.connect.bigquery.convert;
 
 import com.google.cloud.bigquery.InsertAllRequest.RowToInsert;
+import com.google.cloud.bigquery.LegacySQLTypeName;
 import com.google.protobuf.ByteString;
 import com.wepay.kafka.connect.bigquery.api.KafkaSchemaRecordType;
 import com.wepay.kafka.connect.bigquery.config.BigQuerySinkConfig.DecimalHandlingMode;
@@ -31,6 +32,7 @@ import com.wepay.kafka.connect.bigquery.convert.logicaltype.LogicalConverterRegi
 import com.wepay.kafka.connect.bigquery.convert.logicaltype.LogicalTypeConverter;
 import com.wepay.kafka.connect.bigquery.exception.ConversionConnectException;
 import java.nio.ByteBuffer;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -198,6 +200,51 @@ public class BigQueryRecordConverter implements RecordConverter<Map<String, Obje
             + " found in schemaless record data. Can't convert record to bigQuery format");
   }
 
+  /** Microseconds since the epoch of 0001-01-01T00:00:00Z, BigQuery's earliest TIMESTAMP. */
+  private static final long MIN_TIMESTAMP_MICROS = -62135596800000000L;
+
+  /** Microseconds since the epoch of 9999-12-31T23:59:59.999999Z, BigQuery's latest TIMESTAMP. */
+  private static final long MAX_TIMESTAMP_MICROS = 253402300799999999L;
+
+  /**
+   * Converts a timestamp logical value to microseconds since the epoch, for TIMESTAMP columns
+   * written through the Storage Write API.
+   *
+   * <p>The logical type converters format timestamps as strings, which the Storage Write API client
+   * parses back while it builds the protobuf rows. That parse dominates the CPU of a busy writer
+   * and runs inside the per-table writer lock, so it caps each table's throughput. The client takes
+   * a {@code Long} as epoch microseconds for TIMESTAMP columns without parsing.
+   *
+   * @return the microseconds, or {@code null} to fall back to the logical type converter, for
+   *     unknown types and values outside BigQuery's TIMESTAMP range
+   */
+  private static Long toTimestampMicros(String logicalName, Object value) {
+    long micros;
+    try {
+      if (io.debezium.time.MicroTimestamp.SCHEMA_NAME.equals(logicalName)) {
+        micros = (Long) value;
+      } else if (io.debezium.time.Timestamp.SCHEMA_NAME.equals(logicalName)) {
+        micros = Math.multiplyExact((Long) value, 1000L);
+      } else if (org.apache.kafka.connect.data.Timestamp.LOGICAL_NAME.equals(logicalName)) {
+        micros = Math.multiplyExact(((java.util.Date) value).getTime(), 1000L);
+      } else if (io.debezium.time.ZonedTimestamp.SCHEMA_NAME.equals(logicalName)) {
+        Instant instant =
+            Instant.from(io.debezium.time.ZonedTimestamp.FORMATTER.parse((String) value));
+        micros =
+            Math.addExact(
+                Math.multiplyExact(instant.getEpochSecond(), 1_000_000L), instant.getNano() / 1000);
+      } else {
+        return null;
+      }
+    } catch (ArithmeticException | java.time.DateTimeException e) {
+      return null;
+    }
+    if (micros < MIN_TIMESTAMP_MICROS || micros > MAX_TIMESTAMP_MICROS) {
+      return null;
+    }
+    return micros;
+  }
+
   private Object convertObject(Object kafkaConnectObject, Schema kafkaConnectSchema) {
     if (kafkaConnectObject == null) {
       if (kafkaConnectSchema.isOptional()) {
@@ -212,6 +259,12 @@ public class BigQueryRecordConverter implements RecordConverter<Map<String, Obje
     LogicalTypeConverter converter =
         LogicalConverterRegistry.getConverter(kafkaConnectSchema.name());
     if (converter != null) {
+      if (useStorageWriteApi && converter.getBqSchemaType() == LegacySQLTypeName.TIMESTAMP) {
+        Long micros = toTimestampMicros(kafkaConnectSchema.name(), kafkaConnectObject);
+        if (micros != null) {
+          return micros;
+        }
+      }
       return converter.convert(kafkaConnectObject);
     }
     Schema.Type kafkaConnectSchemaType = kafkaConnectSchema.type();
