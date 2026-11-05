@@ -247,6 +247,29 @@ public class StorageWriteApiDefaultStreamTest {
   }
 
   @Test
+  public void testDefaultStreamMessageTooLargeExceptionSplitsBatch() throws Exception {
+    // The client fails an append over 20 MB with INVALID_ARGUMENT, which isn't
+    // an AppendSerializtionError. With schema updates allowed, the batch must
+    // still be split and retried instead of failing the task.
+    ExecutionException tooLarge =
+        new ExecutionException(
+            new StatusRuntimeException(
+                io.grpc.Status.fromCode(io.grpc.Status.Code.INVALID_ARGUMENT)
+                    .withDescription(
+                        "MessageSize is too large. Max allow: 20000000 Actual: 21469290")));
+    when(mockedResponse.get()).thenThrow(tooLarge).thenReturn(successResponse);
+
+    defaultStream.initializeAndWriteRecords(mockedPartitionedTableId, testMultiRows, null);
+
+    ArgumentCaptor<JSONArray> appended = ArgumentCaptor.forClass(JSONArray.class);
+    verify(mockedStreamWriter, times(3)).append(appended.capture());
+    assertEquals(2, appended.getAllValues().get(0).length());
+    assertEquals(1, appended.getAllValues().get(1).length());
+    assertEquals(1, appended.getAllValues().get(2).length());
+    verifyNoInteractions(mockedSchemaManager);
+  }
+
+  @Test
   public void testDefaultStreamClosedException() throws Exception {
     ExecutionException exception =
         new ExecutionException(

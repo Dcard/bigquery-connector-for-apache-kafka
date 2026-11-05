@@ -549,6 +549,11 @@ public abstract class StorageWriteApiBase {
    * @param exception if the exception is not of expected type
    * @return Map of row index to error message detail
    */
+  private static boolean isAppendSerializationError(Exception exception) {
+    return exception instanceof Exceptions.AppendSerializtionError
+        || exception.getCause() instanceof Exceptions.AppendSerializtionError;
+  }
+
   protected Map<Integer, String> getRowErrorMapping(Exception exception) {
     if (exception.getCause() instanceof Exceptions.AppendSerializtionError) {
       exception = (Exceptions.AppendSerializtionError) exception.getCause();
@@ -697,7 +702,11 @@ public abstract class StorageWriteApiBase {
       return true;
     }
 
+    // Only row errors carry a row mapping. Other INVALID_ARGUMENT errors, such
+    // as an append over the request size limit, would make getRowErrorMapping
+    // throw and skip the handling that comes after this check.
     if (BigQueryStorageWriteApiErrorResponses.isMalformedRequest(e.getMessage())
+        && isAppendSerializationError(e)
         && BigQueryStorageWriteApiErrorResponses.hasInvalidSchema(getRowErrorMapping(e).values())) {
       return true;
     }
