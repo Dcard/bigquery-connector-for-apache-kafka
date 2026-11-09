@@ -215,34 +215,44 @@ public class BigQueryRecordConverter implements RecordConverter<Map<String, Obje
    * and runs inside the per-table writer lock, so it caps each table's throughput. The client takes
    * a {@code Long} as epoch microseconds for TIMESTAMP columns without parsing.
    *
+   * <p>Values outside BigQuery's TIMESTAMP range are clamped to it: BigQuery rejects them, which
+   * would fail the whole row. Postgres {@code 0001-01-01 00:00:00+00}, which Go writes for its zero
+   * time, reaches the sink as {@code 0000-12-30T00:00:00Z} (Debezium formats it in the Julian
+   * calendar), so it becomes BigQuery's earliest TIMESTAMP, 0001-01-01.
+   *
    * @return the microseconds, or {@code null} to fall back to the logical type converter, for
-   *     unknown types and values outside BigQuery's TIMESTAMP range
+   *     unknown types and values that can't be parsed
    */
   private static Long toTimestampMicros(String logicalName, Object value) {
     long micros;
+    // The sign of the value, which decides the clamp when the microseconds overflow a long
+    long sign = 0;
     try {
       if (io.debezium.time.MicroTimestamp.SCHEMA_NAME.equals(logicalName)) {
+        sign = (Long) value;
         micros = (Long) value;
       } else if (io.debezium.time.Timestamp.SCHEMA_NAME.equals(logicalName)) {
+        sign = (Long) value;
         micros = Math.multiplyExact((Long) value, 1000L);
       } else if (org.apache.kafka.connect.data.Timestamp.LOGICAL_NAME.equals(logicalName)) {
-        micros = Math.multiplyExact(((java.util.Date) value).getTime(), 1000L);
+        sign = ((java.util.Date) value).getTime();
+        micros = Math.multiplyExact(sign, 1000L);
       } else if (io.debezium.time.ZonedTimestamp.SCHEMA_NAME.equals(logicalName)) {
         Instant instant =
             Instant.from(io.debezium.time.ZonedTimestamp.FORMATTER.parse((String) value));
+        sign = instant.getEpochSecond();
         micros =
             Math.addExact(
                 Math.multiplyExact(instant.getEpochSecond(), 1_000_000L), instant.getNano() / 1000);
       } else {
         return null;
       }
-    } catch (ArithmeticException | java.time.DateTimeException e) {
+    } catch (java.time.DateTimeException e) {
       return null;
+    } catch (ArithmeticException e) {
+      return sign < 0 ? MIN_TIMESTAMP_MICROS : MAX_TIMESTAMP_MICROS;
     }
-    if (micros < MIN_TIMESTAMP_MICROS || micros > MAX_TIMESTAMP_MICROS) {
-      return null;
-    }
-    return micros;
+    return Math.max(MIN_TIMESTAMP_MICROS, Math.min(MAX_TIMESTAMP_MICROS, micros));
   }
 
   private Object convertObject(Object kafkaConnectObject, Schema kafkaConnectSchema) {

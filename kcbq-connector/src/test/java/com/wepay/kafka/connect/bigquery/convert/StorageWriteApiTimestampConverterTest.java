@@ -24,6 +24,7 @@
 package com.wepay.kafka.connect.bigquery.convert;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -146,14 +147,58 @@ class StorageWriteApiTimestampConverterTest {
     assertEquals(expected, convert(schema, value, true));
   }
 
-  @Test
-  void outOfRangeFallsBackToTheString() {
+  static Stream<Arguments> outOfRange() {
+    long earliest = micros("0001-01-01T00:00:00Z");
+    long latest = micros("9999-12-31T23:59:59.999999Z");
+    return Stream.of(
+        // Postgres 0001-01-01 00:00:00+00 (Go's zero time), as Debezium formats it
+        Arguments.of(
+            "Debezium ZonedTimestamp in year 0",
+            io.debezium.time.ZonedTimestamp.schema(),
+            "0000-12-30T00:00:00Z",
+            earliest),
+        Arguments.of(
+            "Debezium MicroTimestamp just before year 1",
+            io.debezium.time.MicroTimestamp.schema(),
+            earliest - 1,
+            earliest),
+        Arguments.of(
+            "Debezium MicroTimestamp after year 9999",
+            io.debezium.time.MicroTimestamp.schema(),
+            latest + 1,
+            latest),
+        Arguments.of(
+            "Debezium Timestamp whose micros overflow",
+            io.debezium.time.Timestamp.schema(),
+            Long.MIN_VALUE / 10,
+            earliest),
+        Arguments.of(
+            "Kafka Timestamp whose micros overflow",
+            Timestamp.SCHEMA,
+            new Date(Long.MAX_VALUE / 10),
+            latest),
+        Arguments.of(
+            "Debezium ZonedTimestamp in year +1000000",
+            io.debezium.time.ZonedTimestamp.schema(),
+            "+1000000-01-01T00:00:00Z",
+            latest));
+  }
+
+  @ParameterizedTest(name = "{0}")
+  @MethodSource("outOfRange")
+  void outOfRangeIsClamped(String name, Schema schema, Object value, long expected) {
     initialize(false);
-    // Year 0 is before BigQuery's range. Keep the old string, so the row fails the same way.
-    long beforeYear1 = micros("0001-01-01T00:00:00Z") - 1;
-    assertEquals(
-        convert(io.debezium.time.MicroTimestamp.schema(), beforeYear1, false),
-        convert(io.debezium.time.MicroTimestamp.schema(), beforeYear1, true));
+    // BigQuery rejects values outside its range, which would fail the whole row
+    assertEquals(expected, convert(schema, value, true));
+  }
+
+  @Test
+  void unparseableFallsBackToTheLogicalConverter() {
+    initialize(false);
+    // The logical converter rejects it the same way as before
+    assertThrows(
+        java.time.format.DateTimeParseException.class,
+        () -> convert(io.debezium.time.ZonedTimestamp.schema(), "not a timestamp", true));
   }
 
   @Test
